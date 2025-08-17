@@ -1,0 +1,20 @@
+services:
+  chatui:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: lmstudio-chatui
+    ports:
+      - "8501:8501"
+    # Load environment variables from local .env (OPENAI_BASE_URL, OPENAI_API_KEY, OPENAI_MODEL, etc.)
+    env_file:
+      - .env
+    # Sensible defaults; can be overridden by .env
+    environment:
+      OPENAI_BASE_URL: http://host.docker.internal:1234/v1
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./data:/app/data
+      - ./.env:/app/.env:ro
+    restart: unless-stopped
