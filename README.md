@@ -29,7 +29,7 @@
 
 2. **このリポジトリをクローン**
    ```sh
-   git clone https://github.com/yourname/lmstudio-chatui.git
+   git clone https://github.com/yut0takagi/lmstudio-chatui.git
    cd lmstudio-chatui
    ```
 
