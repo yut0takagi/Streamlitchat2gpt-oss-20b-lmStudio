@@ -22,7 +22,7 @@ import json
 import os
 import uuid
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 import streamlit as st
 
@@ -31,6 +31,12 @@ try:
     from openai import OpenAI
 except Exception as e:
     OpenAI = None
+
+# Serp API for web search
+try:
+    from serpapi import GoogleSearch
+except Exception as e:
+    GoogleSearch = None
 
 APP_TITLE = "Local Chat (LM Studio + Chat Completions)"
 
@@ -67,6 +73,7 @@ def _get_env(*names: str, default: Optional[str] = None) -> Optional[str]:
 DEFAULT_BASE_URL = _get_env("OPENAI_BASE_URL", "BASE_URL", "LMSTUDIO_BASE_URL", default="http://localhost:1234/v1")
 DEFAULT_API_KEY = _get_env("OPENAI_API_KEY", "API_KEY", default="lm-studio")
 DEFAULT_MODEL = _get_env("OPENAI_MODEL", "MODEL", default="openai/gpt-oss-20b")
+SERPAPI_KEY = _get_env("SERPAPI_KEY", default=None)
 
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
@@ -146,6 +153,12 @@ if "last_user_input" not in st.session_state:
 
 if "stop_now" not in st.session_state:
     st.session_state.stop_now = False
+
+if "enable_search" not in st.session_state:
+    st.session_state.enable_search = False
+
+if "num_search_results" not in st.session_state:
+    st.session_state.num_search_results = 5
 
 def _get_current_thread() -> Dict[str, Any]:
     tid = st.session_state.current_thread_id
@@ -249,6 +262,14 @@ with st.sidebar:
                                 help="長文になりがちな場合は小さめに。systemは常に先頭に付与します。")
 
     st.divider()
+    st.subheader("検索設定（Serp API）")
+    st.session_state.enable_search = st.toggle("検索を有効化", value=st.session_state.enable_search, help="ユーザー入力に対して検索を実行し、結果をプロンプトに含めます")
+    if st.session_state.enable_search:
+        if not SERPAPI_KEY:
+            st.warning("⚠️ SERPAPI_KEYが設定されていません。.envファイルに追加してください。")
+        st.session_state.num_search_results = st.number_input("検索結果数", min_value=1, max_value=10, value=st.session_state.num_search_results, step=1)
+
+    st.divider()
     st.subheader("System Prompt")
     _cur = _get_current_thread()
     _cur["system"] = st.text_area(
@@ -261,13 +282,150 @@ with st.sidebar:
     st.caption("このアプリはLM StudioのOpenAI互換APIに接続し、Chat Completionsで応答を生成します。")
 
 
-def _build_payload_messages() -> List[Dict[str, str]]:
-    """Assemble messages including system prompt and clipped history for current thread."""
+def _search_with_serpapi(query: str, num_results: int = 5) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+    """Serp APIを使用して検索を実行し、結果をフォーマットして返す
+    Returns: (formatted_results_text, search_metadata)
+    """
+    if not SERPAPI_KEY:
+        return None, {"error": "SERPAPI_KEYが設定されていません"}
+    if GoogleSearch is None:
+        return None, {"error": "google-search-resultsパッケージがインストールされていません"}
+    
+    try:
+        search = GoogleSearch({
+            "q": query,
+            "api_key": SERPAPI_KEY,
+            "engine": "google",
+            "hl": "ja",
+            "gl": "jp",
+            "num": num_results
+        })
+        results = search.get_dict()
+        
+        # デバッグ: レスポンスのキーを確認
+        response_keys = list(results.keys())
+        
+        # 検索結果をフォーマット
+        formatted_results = []
+        
+        # organic_results（通常の検索結果）
+        organic_results = results.get("organic_results", [])
+        result_count = len(organic_results)
+        
+        for i, result in enumerate(organic_results[:num_results], 1):
+            title = result.get("title", "")
+            link = result.get("link", "")
+            snippet = result.get("snippet", "")
+            if title or link or snippet:
+                formatted_results.append(f"検索結果 {i}:\nタイトル: {title}\nURL: {link}\n内容: {snippet}\n")
+        
+        # knowledge_graph（知識グラフ）がある場合
+        knowledge_graph = results.get("knowledge_graph", {})
+        if knowledge_graph:
+            kg_title = knowledge_graph.get("title", "")
+            kg_type = knowledge_graph.get("type", "")
+            kg_description = knowledge_graph.get("description", "")
+            kg_source = knowledge_graph.get("source", {})
+            kg_source_name = kg_source.get("name", "") if isinstance(kg_source, dict) else ""
+            kg_source_link = kg_source.get("link", "") if isinstance(kg_source, dict) else ""
+            
+            if kg_title or kg_description:
+                formatted_results.insert(0, f"【知識グラフ - 信頼性の高い情報】\nタイトル: {kg_title}\n種類: {kg_type}\n説明: {kg_description}\n出典: {kg_source_name} ({kg_source_link})\n\n")
+        
+        # answer_box（回答ボックス）がある場合
+        answer_box = results.get("answer_box", {})
+        if answer_box:
+            answer_title = answer_box.get("title", "")
+            answer_answer = answer_box.get("answer", "")
+            answer_snippet = answer_box.get("snippet", "")
+            answer_link = answer_box.get("link", "")
+            
+            if answer_title or answer_answer or answer_snippet:
+                formatted_results.insert(0, f"【直接回答 - 最も関連性の高い情報】\n質問: {answer_title}\n回答: {answer_answer}\n詳細: {answer_snippet}\n参考リンク: {answer_link}\n\n")
+        
+        # local_results（ローカル検索結果）がある場合
+        local_results = results.get("local_results", [])
+        if local_results:
+            # local_resultsがリストかどうかを確認
+            if isinstance(local_results, list):
+                for i, local in enumerate(local_results[:3], 1):
+                    if isinstance(local, dict):
+                        local_title = local.get("title", "")
+                        local_address = local.get("address", "")
+                        local_phone = local.get("phone", "")
+                        local_website = local.get("website", "")
+                        if local_title:
+                            formatted_results.append(f"【ローカル結果 {i}】\n{local_title}\n住所: {local_address}\n電話: {local_phone}\nウェブサイト: {local_website}\n\n")
+            elif isinstance(local_results, dict):
+                # 辞書型の場合（単一のローカル結果）
+                local_title = local_results.get("title", "")
+                local_address = local_results.get("address", "")
+                local_phone = local_results.get("phone", "")
+                local_website = local_results.get("website", "")
+                if local_title:
+                    formatted_results.append(f"【ローカル結果】\n{local_title}\n住所: {local_address}\n電話: {local_phone}\nウェブサイト: {local_website}\n\n")
+        
+        metadata = {
+            "query": query,
+            "result_count": result_count,
+            "requested_count": num_results,
+            "success": True,
+            "response_keys": response_keys,
+            "has_knowledge_graph": bool(knowledge_graph),
+            "has_answer_box": bool(answer_box),
+            "has_local_results": bool(local_results)
+        }
+        
+        if formatted_results:
+            formatted_text = "=== 最新の検索結果（質問に回答する際はこの情報を優先的に使用してください） ===\n\n" + "\n".join(formatted_results) + "\n=== 検索結果終了 ===\n"
+            return formatted_text, metadata
+        else:
+            # デバッグ情報を含める
+            metadata["error"] = "検索結果が見つかりませんでした"
+            metadata["debug_info"] = f"レスポンスキー: {response_keys}, organic_results数: {result_count}"
+            return None, metadata
+    except Exception as e:
+        error_msg = str(e)
+        import traceback
+        return None, {"error": f"検索エラー: {error_msg}", "query": query, "success": False, "traceback": traceback.format_exc()}
+
+
+def _build_payload_messages(include_search: bool = False, search_query: Optional[str] = None) -> Tuple[List[Dict[str, str]], Optional[str], Optional[Dict[str, Any]]]:
+    """Assemble messages including system prompt and clipped history for current thread.
+    Returns: (payload_messages, search_results_text, search_metadata)
+    """
     t = _get_current_thread()
     history = t["messages"][-(ctx_limit*2):]
-    payload = [{"role": "system", "content": t.get("system", "")}]
-    payload.extend([{k: v for k, v in m.items() if k in ("role", "content")} for m in history])
-    return payload
+    system_content = t.get("system", "")
+    search_results_text = None
+    search_metadata = None
+    
+    # 検索結果を含める場合
+    if include_search and search_query:
+        search_results_text, search_metadata = _search_with_serpapi(search_query, st.session_state.num_search_results)
+    
+    # Systemプロンプトに検索結果の活用方法を追加
+    if include_search and search_results_text:
+        if "検索結果" not in system_content and "以下の検索結果" not in system_content:
+            system_content = f"{system_content}\n\n【重要】検索機能が有効です。ユーザーの質問に対して、提供された検索結果を必ず参照して回答してください。検索結果に含まれる最新の情報を優先的に使用し、検索結果に基づいた正確で詳細な回答を提供してください。検索結果にない情報は推測せず、検索結果の内容を明確に引用してください。"
+    
+    payload = [{"role": "system", "content": system_content}]
+    
+    # 履歴メッセージを追加（検索結果は最後のuserメッセージの直前に挿入）
+    for idx, m in enumerate(history):
+        role = m.get("role")
+        content = m.get("content", "")
+        
+        # 最後のuserメッセージの直前に検索結果を挿入
+        is_last_user_message = (role == "user" and idx == len(history) - 1)
+        if is_last_user_message and include_search and search_results_text:
+            # 検索結果をuserメッセージの前に追加（より明確な構造で）
+            search_context = f"{search_results_text}\n\n---\n\n上記の検索結果を参照して、以下の質問に回答してください:\n\n{content}"
+            payload.append({"role": "user", "content": search_context})
+        else:
+            payload.append({"role": role, "content": content})
+    
+    return payload, search_results_text, search_metadata
 
 
 def _ensure_client() -> Optional["OpenAI"]:
@@ -302,7 +460,63 @@ def _chat_once_streaming(user_input: str):
     with st.chat_message("assistant"):
         placeholder = st.empty()
 
-    payload_messages = _build_payload_messages()
+    # 検索を実行（有効な場合）
+    search_query = user_input if st.session_state.enable_search else None
+    search_status_container = st.empty()
+    
+    if st.session_state.enable_search and search_query:
+        with search_status_container.container():
+            with st.status("🔍 検索を実行中...", expanded=True) as status:
+                st.write(f"検索クエリ: **{search_query}**")
+                payload_messages, search_results_text, search_metadata = _build_payload_messages(include_search=True, search_query=search_query)
+                
+                if search_metadata:
+                    if search_metadata.get("success"):
+                        status.update(label="✅ 検索完了", state="complete")
+                        st.success(f"検索結果を {search_metadata.get('result_count', 0)} 件取得しました")
+                    else:
+                        status.update(label="❌ 検索エラー", state="error")
+                        error_msg = search_metadata.get("error", "不明なエラー")
+                        st.error(f"検索に失敗しました: {error_msg}")
+                else:
+                    status.update(label="⚠️ 検索未実行", state="error")
+                    st.warning("検索が実行されませんでした")
+    else:
+        payload_messages, search_results_text, search_metadata = _build_payload_messages(include_search=False, search_query=None)
+        if not st.session_state.enable_search:
+            with search_status_container.container():
+                st.info("ℹ️ 検索機能は無効です。サイドバーで有効化できます。")
+    
+    # 検索結果を表示（詳細）
+    if search_results_text and search_metadata and search_metadata.get("success"):
+        with st.expander("🔍 検索結果の詳細", expanded=True):
+            st.markdown(f"**検索クエリ:** {search_metadata.get('query', 'N/A')}")
+            st.markdown(f"**取得件数:** {search_metadata.get('result_count', 0)} / {search_metadata.get('requested_count', 0)} 件")
+            if search_metadata.get("has_knowledge_graph"):
+                st.markdown("✅ 知識グラフあり")
+            if search_metadata.get("has_answer_box"):
+                st.markdown("✅ 回答ボックスあり")
+            if search_metadata.get("has_local_results"):
+                st.markdown("✅ ローカル結果あり")
+            st.divider()
+            st.markdown(search_results_text)
+    elif search_metadata:
+        if search_metadata.get("success") and search_metadata.get("result_count", 0) == 0:
+            # 検索は成功したが結果が0件の場合
+            with st.expander("🔍 検索結果", expanded=True):
+                st.warning(f"**検索結果が0件でした**")
+                st.markdown(f"**検索クエリ:** {search_metadata.get('query', 'N/A')}")
+                if search_metadata.get("debug_info"):
+                    st.code(search_metadata.get("debug_info"), language="text")
+                if search_metadata.get("response_keys"):
+                    st.markdown(f"**レスポンスキー:** {', '.join(search_metadata.get('response_keys', []))}")
+        elif not search_metadata.get("success"):
+            # 検索エラーの場合
+            with st.expander("🔍 検索結果", expanded=True):
+                st.error(f"**エラー:** {search_metadata.get('error', '不明なエラー')}")
+                if search_metadata.get("traceback"):
+                    with st.expander("詳細なエラー情報", expanded=False):
+                        st.code(search_metadata.get("traceback"), language="python")
 
     # streaming request
     started_at = time.time()
@@ -379,7 +593,63 @@ def _chat_once_non_streaming(user_input: str):
     with st.chat_message("assistant"):
         placeholder = st.empty()
 
-    payload_messages = _build_payload_messages()
+    # 検索を実行（有効な場合）
+    search_query = user_input if st.session_state.enable_search else None
+    search_status_container = st.empty()
+    
+    if st.session_state.enable_search and search_query:
+        with search_status_container.container():
+            with st.status("🔍 検索を実行中...", expanded=True) as status:
+                st.write(f"検索クエリ: **{search_query}**")
+                payload_messages, search_results_text, search_metadata = _build_payload_messages(include_search=True, search_query=search_query)
+                
+                if search_metadata:
+                    if search_metadata.get("success"):
+                        status.update(label="✅ 検索完了", state="complete")
+                        st.success(f"検索結果を {search_metadata.get('result_count', 0)} 件取得しました")
+                    else:
+                        status.update(label="❌ 検索エラー", state="error")
+                        error_msg = search_metadata.get("error", "不明なエラー")
+                        st.error(f"検索に失敗しました: {error_msg}")
+                else:
+                    status.update(label="⚠️ 検索未実行", state="error")
+                    st.warning("検索が実行されませんでした")
+    else:
+        payload_messages, search_results_text, search_metadata = _build_payload_messages(include_search=False, search_query=None)
+        if not st.session_state.enable_search:
+            with search_status_container.container():
+                st.info("ℹ️ 検索機能は無効です。サイドバーで有効化できます。")
+    
+    # 検索結果を表示（詳細）
+    if search_results_text and search_metadata and search_metadata.get("success"):
+        with st.expander("🔍 検索結果の詳細", expanded=True):
+            st.markdown(f"**検索クエリ:** {search_metadata.get('query', 'N/A')}")
+            st.markdown(f"**取得件数:** {search_metadata.get('result_count', 0)} / {search_metadata.get('requested_count', 0)} 件")
+            if search_metadata.get("has_knowledge_graph"):
+                st.markdown("✅ 知識グラフあり")
+            if search_metadata.get("has_answer_box"):
+                st.markdown("✅ 回答ボックスあり")
+            if search_metadata.get("has_local_results"):
+                st.markdown("✅ ローカル結果あり")
+            st.divider()
+            st.markdown(search_results_text)
+    elif search_metadata:
+        if search_metadata.get("success") and search_metadata.get("result_count", 0) == 0:
+            # 検索は成功したが結果が0件の場合
+            with st.expander("🔍 検索結果", expanded=True):
+                st.warning(f"**検索結果が0件でした**")
+                st.markdown(f"**検索クエリ:** {search_metadata.get('query', 'N/A')}")
+                if search_metadata.get("debug_info"):
+                    st.code(search_metadata.get("debug_info"), language="text")
+                if search_metadata.get("response_keys"):
+                    st.markdown(f"**レスポンスキー:** {', '.join(search_metadata.get('response_keys', []))}")
+        elif not search_metadata.get("success"):
+            # 検索エラーの場合
+            with st.expander("🔍 検索結果", expanded=True):
+                st.error(f"**エラー:** {search_metadata.get('error', '不明なエラー')}")
+                if search_metadata.get("traceback"):
+                    with st.expander("詳細なエラー情報", expanded=False):
+                        st.code(search_metadata.get("traceback"), language="python")
 
     started_at = time.time()
     try:

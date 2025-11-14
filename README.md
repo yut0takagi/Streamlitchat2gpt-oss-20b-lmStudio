@@ -72,7 +72,7 @@
 | OPENAI_BASE_URL    | LM StudioのAPIエンドポイント                 | http://host.docker.internal:1234/v1     |
 | OPENAI_API_KEY     | 任意（LM Studioでは任意文字列でOK）           | lm-studio                               |
 | OPENAI_MODEL       | 使用するモデル名（LM Studioで有効なもの）     | openai/gpt-oss-20b                      |
-
+| SERPAPI_KEY       | 検索機能を使う場合に必要なSerp API Key     |  ーーー                      |
 ---
 
 ## よくある質問
